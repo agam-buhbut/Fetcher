@@ -1,0 +1,18 @@
+[package]
+name = "taskmgr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "taskmgr-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+taskmgr-core = { path = "../core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+anyhow = { workspace = true }

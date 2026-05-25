@@ -1,0 +1,19 @@
+[package]
+name = "taskmgr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "taskmgr_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sysinfo = { workspace = true }
+nix = { workspace = true }
+zbus = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

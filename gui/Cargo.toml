@@ -1,0 +1,18 @@
+[package]
+name = "taskmgr-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "taskmgr-gui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+taskmgr-core = { path = "../core" }
+eframe = { workspace = true }
+egui_plot = { workspace = true }
+anyhow = { workspace = true }
