@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use crossterm::event::KeyCode;
+use ratatui::widgets::TableState;
 use taskmgr_core::services::{list_units, service_action, ServiceOp, ServiceScope, ServiceUnit};
 use taskmgr_core::startup::{list_entries, set_enabled, AutostartEntry};
 use taskmgr_core::{
@@ -45,14 +46,16 @@ impl Tab {
         }
     }
 
+    /// CPU/mem/disk/net are a handful of /proc reads — sample them every
+    /// tick on every tab so the Performance graphs never have time gaps.
+    /// Only the expensive process-table refresh is gated to its tab.
     fn refresh_kind(self) -> RefreshKind {
-        match self {
-            Self::Processes => RefreshKind::processes_tab(),
-            Self::Performance => RefreshKind::performance(),
-            Self::Startup | Self::Services => RefreshKind {
-                memory: true,
-                ..RefreshKind::nothing()
-            },
+        RefreshKind {
+            cpu: true,
+            memory: true,
+            disks: true,
+            networks: true,
+            processes: self == Self::Processes,
         }
     }
 }
@@ -69,11 +72,20 @@ pub(crate) struct App {
     pub(crate) disk_history: VecDeque<u64>,
     pub(crate) net_history: VecDeque<u64>,
 
-    // Processes tab.
+    // Processes tab. Selection is tracked by PID (the index is re-derived
+    // after every re-sort) so the highlight — and `x` — stays on the same
+    // process while the list churns underneath.
     pub(crate) proc_selected: usize,
+    pub(crate) proc_selected_pid: Option<u32>,
     pub(crate) sort: SortState,
     pub(crate) filter: String,
     pub(crate) filter_active: bool,
+
+    // Table widget state persists across frames so the scroll offset is
+    // stable instead of resetting every draw.
+    pub(crate) proc_table: TableState,
+    pub(crate) startup_table: TableState,
+    pub(crate) services_table: TableState,
 
     // Startup tab.
     pub(crate) autostart: Vec<AutostartEntry>,
@@ -100,9 +112,13 @@ impl App {
             disk_history: VecDeque::with_capacity(HISTORY_LEN),
             net_history: VecDeque::with_capacity(HISTORY_LEN),
             proc_selected: 0,
+            proc_selected_pid: None,
             sort: SortState::default(),
             filter: String::new(),
             filter_active: false,
+            proc_table: TableState::default(),
+            startup_table: TableState::default(),
+            services_table: TableState::default(),
             autostart: Vec::new(),
             startup_selected: 0,
             startup_dirty: true,
@@ -115,7 +131,13 @@ impl App {
     }
 
     pub(crate) fn tick(&mut self) {
-        self.snapshot = self.sampler.tick(self.tab.refresh_kind());
+        let mut snap = self.sampler.tick(self.tab.refresh_kind());
+        // Keep the last process list alive while on other tabs so switching
+        // back to Processes never shows a blank table for a tick.
+        if snap.processes.is_none() {
+            snap.processes = self.snapshot.processes.take();
+        }
+        self.snapshot = snap;
 
         // Update Performance history regardless of tab so the graphs aren't blank
         // the moment the user switches.
@@ -138,13 +160,11 @@ impl App {
             );
         }
 
-        // Apply current sort to processes.
+        // Apply current sort to processes, then re-locate the selected PID.
         if let Some(rows) = &mut self.snapshot.processes {
             sort_in_place(rows, self.sort);
-            if self.proc_selected >= rows.len() && !rows.is_empty() {
-                self.proc_selected = rows.len() - 1;
-            }
         }
+        self.resync_proc_selection();
 
         if let Some((t, _)) = self.status {
             if t.elapsed().as_secs() > 4 {
@@ -217,10 +237,39 @@ impl App {
 
     fn set_selection(&mut self, idx: usize) {
         match self.tab {
-            Tab::Processes => self.proc_selected = idx,
+            Tab::Processes => {
+                let pid = self.filtered_processes().get(idx).map(|r| r.pid);
+                self.proc_selected = idx;
+                self.proc_selected_pid = pid;
+            }
             Tab::Startup => self.startup_selected = idx,
             Tab::Services => self.services_selected = idx,
             Tab::Performance => {}
+        }
+    }
+
+    /// Re-derive `proc_selected` from the tracked PID after anything that
+    /// reorders or shrinks the visible list (tick, sort change, filter edit).
+    /// If the process is gone, stay at the same spot and adopt that row.
+    pub(crate) fn resync_proc_selection(&mut self) {
+        let (len, found, pid_here) = {
+            let rows = self.filtered_processes();
+            let found = self
+                .proc_selected_pid
+                .and_then(|pid| rows.iter().position(|r| r.pid == pid));
+            let clamped = self.proc_selected.min(rows.len().saturating_sub(1));
+            (rows.len(), found, rows.get(clamped).map(|r| r.pid))
+        };
+        if len == 0 {
+            self.proc_selected = 0;
+            self.proc_selected_pid = None;
+            return;
+        }
+        if let Some(idx) = found {
+            self.proc_selected = idx;
+        } else {
+            self.proc_selected = self.proc_selected.min(len - 1);
+            self.proc_selected_pid = pid_here;
         }
     }
 
@@ -236,19 +285,29 @@ impl App {
             KeyCode::Char('/') => {
                 self.filter_active = true;
                 self.filter.clear();
+                self.resync_proc_selection();
             }
             // 'k' is reserved as the global vim-style "move up" binding, so
             // kill uses 'x' (term) / 'X' (kill -9). Plain Delete works too.
             KeyCode::Char('x') | KeyCode::Delete => self.kill_selected(KillSignal::Term),
             KeyCode::Char('X') => self.kill_selected(KillSignal::Kill),
-            KeyCode::Char('s') => self.sort.cycle(SortColumn::Cpu),
-            KeyCode::Char('m') => self.sort.cycle(SortColumn::Memory),
-            KeyCode::Char('p') => self.sort.cycle(SortColumn::Pid),
-            KeyCode::Char('n') => self.sort.cycle(SortColumn::Name),
-            KeyCode::Char('r') => self.sort.cycle(SortColumn::NetRx),
-            KeyCode::Char('t') => self.sort.cycle(SortColumn::NetTx),
+            KeyCode::Char('s') => self.cycle_sort(SortColumn::Cpu),
+            KeyCode::Char('m') => self.cycle_sort(SortColumn::Memory),
+            KeyCode::Char('p') => self.cycle_sort(SortColumn::Pid),
+            KeyCode::Char('n') => self.cycle_sort(SortColumn::Name),
+            KeyCode::Char('d') => self.cycle_sort(SortColumn::DiskRead),
+            KeyCode::Char('w') => self.cycle_sort(SortColumn::DiskWrite),
             _ => {}
         }
+    }
+
+    /// Sort changes take effect on the next frame, not the next 1s tick.
+    fn cycle_sort(&mut self, column: SortColumn) {
+        self.sort.cycle(column);
+        if let Some(rows) = &mut self.snapshot.processes {
+            sort_in_place(rows, self.sort);
+        }
+        self.resync_proc_selection();
     }
 
     fn kill_selected(&mut self, sig: KillSignal) {

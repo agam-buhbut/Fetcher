@@ -17,14 +17,16 @@ pub(crate) enum Tab {
 }
 
 impl Tab {
+    /// CPU/mem/disk/net are a handful of /proc reads — sample them every
+    /// tick on every tab so the Performance graphs never have time gaps.
+    /// Only the expensive process-table refresh is gated to its tab.
     fn refresh_kind(self) -> RefreshKind {
-        match self {
-            Self::Processes => RefreshKind::processes_tab(),
-            Self::Performance => RefreshKind::performance(),
-            Self::Startup | Self::Services => RefreshKind {
-                memory: true,
-                ..RefreshKind::nothing()
-            },
+        RefreshKind {
+            cpu: true,
+            memory: true,
+            disks: true,
+            networks: true,
+            processes: self == Self::Processes,
         }
     }
 }
@@ -90,7 +92,13 @@ impl App {
         }
         self.last_tick = Instant::now();
 
-        self.snapshot = self.sampler.tick(self.tab.refresh_kind());
+        let mut snap = self.sampler.tick(self.tab.refresh_kind());
+        // Keep the last process list alive while on other tabs so switching
+        // back to Processes never shows a blank table for a tick.
+        if snap.processes.is_none() {
+            snap.processes = self.snapshot.processes.take();
+        }
+        self.snapshot = snap;
 
         if let Some(c) = &self.snapshot.cpu {
             push(&mut self.cpu_history, f64::from(c.global_usage));
@@ -101,13 +109,13 @@ impl App {
         if let Some(d) = self.snapshot.disk {
             push(
                 &mut self.disk_history,
-                (d.read_bytes_per_sec + d.write_bytes_per_sec) as f64,
+                d.read_bytes_per_sec.saturating_add(d.write_bytes_per_sec) as f64,
             );
         }
         if let Some(n) = self.snapshot.network {
             push(
                 &mut self.net_history,
-                (n.rx_bytes_per_sec + n.tx_bytes_per_sec) as f64,
+                n.rx_bytes_per_sec.saturating_add(n.tx_bytes_per_sec) as f64,
             );
         }
 

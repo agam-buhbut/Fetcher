@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 
-use eframe::egui::{self, Color32, RichText, ScrollArea};
+use eframe::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
+use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
+use taskmgr_core::processes::sort_in_place;
 use taskmgr_core::services::{service_action, ServiceOp, ServiceScope};
 use taskmgr_core::startup::{set_enabled, AutostartScope};
 use taskmgr_core::{
@@ -49,9 +51,30 @@ impl eframe::App for App {
             Tab::Services => draw_services(ui, self),
         });
 
-        // Idle when nothing changes — keeps GUI cheap.
-        ctx.request_repaint_after(TICK);
+        // Idle when nothing changes — keeps GUI cheap. Schedule the wake-up
+        // for when the *current* tick interval expires, not TICK from the end
+        // of this frame, so samples don't drift and skip a second.
+        ctx.request_repaint_after(TICK.saturating_sub(self.last_tick.elapsed()));
     }
+}
+
+/// Right-aligned monospace numeric cell (table cells default left-aligned).
+fn num(ui: &mut egui::Ui, text: String) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.monospace(text);
+    });
+}
+
+/// Left-aligned text cell, truncated with `…` instead of wrapping.
+fn text_cell(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.add(egui::Label::new(text).truncate());
+}
+
+/// Per-process disk rate cell. A true 0 B/s and a permission-denied
+/// `/proc/<pid>/io` read are indistinguishable, so render both as "—"
+/// rather than a wall of zeros.
+fn rate_str(v: u64) -> String {
+    opt_bytes((v > 0).then_some(v))
 }
 
 fn draw_performance(ui: &mut egui::Ui, app: &App) {
@@ -75,6 +98,13 @@ fn draw_performance(ui: &mut egui::Ui, app: &App) {
                 human_bytes(m.total_bytes),
                 m.used_percent()
             ));
+            if m.swap_total_bytes > 0 {
+                ui.label(format!(
+                    "Swap  {} / {}",
+                    human_bytes(m.swap_used_bytes),
+                    human_bytes(m.swap_total_bytes)
+                ));
+            }
         }
         plot_history(ui, "mem", &app.mem_history, Some(100.0));
 
@@ -95,79 +125,105 @@ fn draw_processes(ui: &mut egui::Ui, app: &mut App) {
     });
     ui.separator();
 
-    let rows: Vec<ProcessRow> = match &app.snapshot.processes {
-        Some(rs) => rs
-            .iter()
-            .filter(|r| r.matches(&app.filter))
-            .cloned()
-            .collect(),
-        None => Vec::new(),
-    };
+    let row_h = ui.spacing().interact_size.y;
 
-    let mut new_sort: Option<SortColumn> = None;
-    let arrow = |c: SortColumn| -> &'static str {
-        if c == app.sort.column {
-            match app.sort.order {
-                SortOrder::Ascending => " ▲",
-                SortOrder::Descending => " ▼",
-            }
-        } else {
-            ""
-        }
-    };
+    // Sort clicks land after the table renders; egui repaints on interaction
+    // so the new order is visible the very next frame.
+    let mut clicked: Option<SortColumn> = None;
+    let mut to_kill: Option<(u32, KillSignal, String)> = None;
+    {
+        // References only — cloning every row (and all its strings) each
+        // frame was the hottest allocation in the GUI.
+        let rows: Vec<&ProcessRow> = app
+            .snapshot
+            .processes
+            .as_deref()
+            .map(|rs| rs.iter().filter(|r| r.matches(&app.filter)).collect())
+            .unwrap_or_default();
 
-    ui.horizontal(|ui| {
-        for (col, label) in [
-            (SortColumn::Pid, "PID"),
-            (SortColumn::Name, "Name"),
-            (SortColumn::Cpu, "CPU%"),
-            (SortColumn::Memory, "Mem"),
-            (SortColumn::NetRx, "Net RX"),
-            (SortColumn::NetTx, "Net TX"),
-        ] {
-            if ui.button(format!("{label}{}", arrow(col))).clicked() {
-                new_sort = Some(col);
-            }
-        }
-    });
-    ui.separator();
+        let sort = app.sort;
+        let header_label = |c: SortColumn, label: &str| -> RichText {
+            let text = if c == sort.column {
+                match sort.order {
+                    SortOrder::Ascending => format!("{label} ▲"),
+                    SortOrder::Descending => format!("{label} ▼"),
+                }
+            } else {
+                label.to_string()
+            };
+            RichText::new(text).strong()
+        };
 
-    if let Some(c) = new_sort {
-        app.sort.cycle(c);
+        // push_id: column-resize state is keyed by Id; keep the two tables
+        // (Processes / Services) from sharing widths.
+        ui.push_id("proc_table", |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::exact(64.0)) // PID
+                .column(Column::exact(88.0)) // User
+                .column(Column::remainder().at_least(120.0).clip(true)) // Name
+                .column(Column::exact(64.0)) // CPU%
+                .column(Column::exact(80.0)) // Mem
+                .column(Column::exact(80.0)) // DiskR/s
+                .column(Column::exact(80.0)) // DiskW/s
+                .column(Column::auto().at_least(100.0)) // kill buttons
+                .header(row_h + 4.0, |mut h| {
+                    for (c, label) in [
+                        (Some(SortColumn::Pid), "PID"),
+                        (None, "User"),
+                        (Some(SortColumn::Name), "Name"),
+                        (Some(SortColumn::Cpu), "CPU%"),
+                        (Some(SortColumn::Memory), "Mem"),
+                        (Some(SortColumn::DiskRead), "DiskR/s"),
+                        (Some(SortColumn::DiskWrite), "DiskW/s"),
+                        (None, ""),
+                    ] {
+                        h.col(|ui| match c {
+                            // Header doubles as the sort button.
+                            Some(c) => {
+                                let btn = egui::Button::new(header_label(c, label)).frame(false);
+                                if ui.add(btn).clicked() {
+                                    clicked = Some(c);
+                                }
+                            }
+                            None => {
+                                ui.strong(label);
+                            }
+                        });
+                    }
+                })
+                .body(|body| {
+                    // Virtualized: only visible rows are laid out each frame.
+                    body.rows(row_h, rows.len(), |mut trow| {
+                        let r = rows[trow.index()];
+                        trow.col(|ui| num(ui, r.pid.to_string()));
+                        trow.col(|ui| text_cell(ui, r.user.as_str()));
+                        trow.col(|ui| text_cell(ui, r.name.as_str()));
+                        trow.col(|ui| num(ui, format!("{:.1}", r.cpu_percent)));
+                        trow.col(|ui| num(ui, human_bytes(r.memory_bytes)));
+                        trow.col(|ui| num(ui, rate_str(r.disk_read_per_sec)));
+                        trow.col(|ui| num(ui, rate_str(r.disk_write_per_sec)));
+                        trow.col(|ui| {
+                            if ui.small_button("End").clicked() {
+                                to_kill = Some((r.pid, KillSignal::Term, r.name.clone()));
+                            }
+                            if ui.small_button("Force").clicked() {
+                                to_kill = Some((r.pid, KillSignal::Kill, r.name.clone()));
+                            }
+                        });
+                    });
+                });
+        });
     }
 
-    let mut to_kill: Option<(u32, KillSignal, String)> = None;
-    ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("proc_grid")
-            .striped(true)
-            .num_columns(8)
-            .show(ui, |ui| {
-                for h in ["PID", "User", "Name", "CPU%", "Mem", "RX/s", "TX/s", ""] {
-                    ui.label(RichText::new(h).strong());
-                }
-                ui.end_row();
-
-                for r in &rows {
-                    ui.label(r.pid.to_string());
-                    ui.label(&r.user);
-                    ui.label(&r.name);
-                    ui.label(format!("{:.1}", r.cpu_percent));
-                    ui.label(human_bytes(r.memory_bytes));
-                    ui.label(opt_bytes(r.net_rx_per_sec));
-                    ui.label(opt_bytes(r.net_tx_per_sec));
-                    ui.horizontal(|ui| {
-                        if ui.small_button("End").clicked() {
-                            to_kill = Some((r.pid, KillSignal::Term, r.name.clone()));
-                        }
-                        if ui.small_button("Force").clicked() {
-                            to_kill = Some((r.pid, KillSignal::Kill, r.name.clone()));
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-    });
-
+    if let Some(c) = clicked {
+        app.sort.cycle(c);
+        if let Some(rows) = &mut app.snapshot.processes {
+            sort_in_place(rows, app.sort);
+        }
+    }
     if let Some((pid, sig, name)) = to_kill {
         match kill_process(pid, sig) {
             Ok(()) => app.set_status(format!("sent {sig:?} to {name} ({pid})")),
@@ -246,28 +302,44 @@ fn draw_services(ui: &mut egui::Ui, app: &mut App) {
     });
     ui.separator();
 
+    let row_h = ui.spacing().interact_size.y;
+
     let mut action: Option<(String, ServiceOp)> = None;
-    ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("svc_grid")
+    // Virtualized: only the visible slice is laid out each frame (each row
+    // carries five buttons, so full layout was the GUI's other hot path).
+    ui.push_id("svc_table", |ui| {
+        TableBuilder::new(ui)
             .striped(true)
-            .num_columns(5)
-            .show(ui, |ui| {
-                for h in ["Name", "Active", "Sub", "Description", "Actions"] {
-                    ui.label(RichText::new(h).strong());
+            .resizable(true)
+            .cell_layout(Layout::left_to_right(Align::Center))
+            .column(Column::exact(260.0)) // Name
+            .column(Column::exact(70.0)) // Active
+            .column(Column::exact(90.0)) // Sub
+            .column(Column::remainder().at_least(120.0).clip(true)) // Description
+            .column(Column::auto().at_least(280.0)) // Actions
+            .header(row_h + 4.0, |mut h| {
+                for label in ["Name", "Active", "Sub", "Description", "Actions"] {
+                    h.col(|ui| {
+                        ui.strong(label);
+                    });
                 }
-                ui.end_row();
-                for u in &app.services {
-                    ui.label(&u.name);
-                    let color = match u.active_state.as_str() {
-                        "active" => Color32::LIGHT_GREEN,
-                        "failed" => Color32::LIGHT_RED,
-                        "inactive" => Color32::GRAY,
-                        _ => Color32::YELLOW,
-                    };
-                    ui.label(RichText::new(&u.active_state).color(color));
-                    ui.label(&u.sub_state);
-                    ui.label(&u.description);
-                    ui.horizontal(|ui| {
+            })
+            .body(|body| {
+                body.rows(row_h, app.services.len(), |mut trow| {
+                    let u = &app.services[trow.index()];
+                    trow.col(|ui| text_cell(ui, u.name.as_str()));
+                    trow.col(|ui| {
+                        let color = match u.active_state.as_str() {
+                            "active" => Color32::LIGHT_GREEN,
+                            "failed" => Color32::LIGHT_RED,
+                            "inactive" => Color32::GRAY,
+                            _ => Color32::YELLOW,
+                        };
+                        text_cell(ui, RichText::new(&u.active_state).color(color));
+                    });
+                    trow.col(|ui| text_cell(ui, u.sub_state.as_str()));
+                    trow.col(|ui| text_cell(ui, u.description.as_str()));
+                    trow.col(|ui| {
                         for (label, op) in [
                             ("Start", ServiceOp::Start),
                             ("Stop", ServiceOp::Stop),
@@ -280,8 +352,7 @@ fn draw_services(ui: &mut egui::Ui, app: &mut App) {
                             }
                         }
                     });
-                    ui.end_row();
-                }
+                });
             });
     });
     if let Some((unit, op)) = action {

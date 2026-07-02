@@ -75,6 +75,10 @@ pub struct Sampler {
     users: Users,
     last_tick: Option<Instant>,
     last_diskstats: Option<(Instant, DiskCounters)>,
+    /// When processes were last refreshed. Per-process disk rates are
+    /// normalized against this, not `last_tick` — the process subsystem
+    /// skips ticks while other tabs are active.
+    last_proc_tick: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -94,6 +98,7 @@ impl Sampler {
             users: Users::new_with_refreshed_list(),
             last_tick: None,
             last_diskstats: None,
+            last_proc_tick: None,
         }
     }
 
@@ -159,36 +164,47 @@ impl Sampler {
                 ProcessRefreshKind::new()
                     .with_cpu()
                     .with_memory()
+                    .with_disk_usage()
                     .with_user(UpdateKind::OnlyIfNotSet),
             );
+            // sysinfo's first disk-usage delta is the process's lifetime
+            // total, not a rate — report 0 until we have a real interval.
+            let proc_dt = self
+                .last_proc_tick
+                .map(|t| (now - t).as_secs_f64().max(0.001));
+            self.last_proc_tick = Some(now);
+            let rate = |bytes: u64| proc_dt.map_or(0, |dt| (bytes as f64 / dt) as u64);
             let users = &self.users;
             let rows: Vec<ProcessRow> = self
                 .system
                 .processes()
                 .iter()
-                .map(|(pid, p)| ProcessRow {
-                    pid: pid.as_u32(),
-                    parent_pid: p.parent().map(Pid::as_u32),
-                    name: p.name().to_string_lossy().into_owned(),
-                    user: p
-                        .user_id()
-                        .and_then(|uid| users.get_user_by_id(uid))
-                        .map_or_else(|| "-".to_string(), |u| u.name().to_string()),
-                    cpu_percent: p.cpu_usage(),
-                    memory_bytes: p.memory(),
-                    status: match p.status() {
-                        sysinfo::ProcessStatus::Run => ProcessStatus::Running,
-                        sysinfo::ProcessStatus::Sleep | sysinfo::ProcessStatus::Idle => {
-                            ProcessStatus::Sleeping
-                        }
-                        sysinfo::ProcessStatus::Stop => ProcessStatus::Stopped,
-                        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead => {
-                            ProcessStatus::Zombie
-                        }
-                        _ => ProcessStatus::Other,
-                    },
-                    net_rx_per_sec: None,
-                    net_tx_per_sec: None,
+                .map(|(pid, p)| {
+                    let du = p.disk_usage();
+                    ProcessRow {
+                        pid: pid.as_u32(),
+                        parent_pid: p.parent().map(Pid::as_u32),
+                        name: p.name().to_string_lossy().into_owned(),
+                        user: p
+                            .user_id()
+                            .and_then(|uid| users.get_user_by_id(uid))
+                            .map_or_else(|| "-".to_string(), |u| u.name().to_string()),
+                        cpu_percent: p.cpu_usage(),
+                        memory_bytes: p.memory(),
+                        status: match p.status() {
+                            sysinfo::ProcessStatus::Run => ProcessStatus::Running,
+                            sysinfo::ProcessStatus::Sleep | sysinfo::ProcessStatus::Idle => {
+                                ProcessStatus::Sleeping
+                            }
+                            sysinfo::ProcessStatus::Stop => ProcessStatus::Stopped,
+                            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead => {
+                                ProcessStatus::Zombie
+                            }
+                            _ => ProcessStatus::Other,
+                        },
+                        disk_read_per_sec: rate(du.read_bytes),
+                        disk_write_per_sec: rate(du.written_bytes),
+                    }
                 })
                 .collect();
             snap.processes = Some(rows);
@@ -234,9 +250,7 @@ fn read_diskstats() -> Option<DiskCounters> {
     let entries = fs::read_dir("/sys/block").ok()?;
     for e in entries.flatten() {
         let name = e.file_name();
-        let name_s = name.to_string_lossy();
-        // Skip RAM disks and loop devices; they inflate totals with no real I/O significance.
-        if name_s.starts_with("ram") || name_s.starts_with("loop") {
+        if !is_physical_disk(&name.to_string_lossy()) {
             continue;
         }
         let stat_path = e.path().join("stat");
@@ -255,6 +269,15 @@ fn read_diskstats() -> Option<DiskCounters> {
         counters.write_bytes = counters.write_bytes.saturating_add(sectors_written * 512);
     }
     Some(counters)
+}
+
+/// Keep only devices whose I/O represents real disk traffic once.
+/// Skipped: `ram*`/`loop*` (no real I/O), `zram*` (swap-in-RAM, not disk),
+/// `dm-*` and `md*` (device-mapper / RAID layers — their traffic is already
+/// counted on the member disks underneath).
+fn is_physical_disk(name: &str) -> bool {
+    const SKIP: [&str; 5] = ["ram", "loop", "zram", "dm-", "md"];
+    !SKIP.iter().any(|p| name.starts_with(p))
 }
 
 #[cfg(test)]
@@ -297,6 +320,16 @@ mod tests {
         });
         let cpu = snap.cpu.expect("cpu requested");
         assert!(!cpu.per_core.is_empty());
+    }
+
+    #[test]
+    fn physical_disk_filter_skips_virtual_layers() {
+        for real in ["sda", "nvme0n1", "mmcblk0", "vda", "sr0"] {
+            assert!(is_physical_disk(real), "{real} should count");
+        }
+        for layered in ["zram0", "dm-0", "md127", "loop3", "ram1"] {
+            assert!(!is_physical_disk(layered), "{layered} should be skipped");
+        }
     }
 
     #[test]

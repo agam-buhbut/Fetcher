@@ -52,12 +52,16 @@ Tabs
 ----
 Processes
   Live list of all running processes. Updates every second.
-  Columns: PID, User, Name, Status, CPU%, Memory, Net RX/s, Net TX/s.
+  Columns: PID, User, Name, Status, CPU%, Memory, Disk R/s, Disk W/s.
+  Per-process disk rates come from /proc/<pid>/io; the kernel hides
+  other users' counters, so those rows show "—" unless run as root.
 
 Performance
   Real-time gauges and scrolling history graphs for CPU usage,
-  memory usage, disk I/O (read + write), and network I/O (RX + TX).
-  History depth: 120 seconds.
+  memory usage (plus swap, when present), disk I/O (read + write),
+  and network I/O (RX + TX). History depth: 120 seconds.
+  Disk I/O counts physical disks only — device-mapper/RAID layers
+  and zram are excluded so stacked traffic isn't double-counted.
 
 Startup
   XDG autostart entries for the current user and system-wide.
@@ -86,8 +90,8 @@ Processes tab
   m                   Sort by memory
   p                   Sort by PID
   n                   Sort by name
-  r                   Sort by network RX
-  t                   Sort by network TX
+  d                   Sort by disk read
+  w                   Sort by disk write
   x  or  Delete       Send SIGTERM to selected process
   X                   Send SIGKILL to selected process
 
@@ -110,4 +114,5 @@ Project Layout
   core/       Shared OS-touching library (no UI dependencies)
   cli/        Terminal frontend
   gui/        Desktop GUI frontend
+  assets/     Launcher icon installed by install.sh
   Cargo.toml  Workspace manifest

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -65,7 +66,7 @@ fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         match app.tab {
             Tab::Processes => {
-                "[1-4] tab  [↑↓/jk] select  [s/m/p/n/r/t] sort  [x] kill  [X] force  [/] filter  [q] quit"
+                "[1-4] tab  [↑↓/jk] select  [s/m/p/n/d/w] sort  [x] kill  [X] force  [/] filter  [q] quit"
                     .into()
             }
             Tab::Performance => "[1-4] tab  [q] quit".into(),
@@ -114,11 +115,23 @@ fn draw_performance(f: &mut Frame<'_>, area: Rect, app: &App) {
         None => "CPU".into(),
     };
     let mem_label = match &app.snapshot.memory {
-        Some(m) => format!(
-            "Memory  {} / {}",
-            human_bytes(m.used_bytes),
-            human_bytes(m.total_bytes)
-        ),
+        Some(m) => {
+            let mut label = format!(
+                "Memory  {} / {}",
+                human_bytes(m.used_bytes),
+                human_bytes(m.total_bytes)
+            );
+            if m.swap_total_bytes > 0 {
+                // Infallible on String; let _ = keeps unused_must_use happy.
+                let _ = write!(
+                    label,
+                    "   ·   Swap  {} / {}",
+                    human_bytes(m.swap_used_bytes),
+                    human_bytes(m.swap_total_bytes)
+                );
+            }
+            label
+        }
         None => "Memory".into(),
     };
 
@@ -137,12 +150,15 @@ fn draw_performance(f: &mut Frame<'_>, area: Rect, app: &App) {
         chunks[1],
     );
 
+    // Percent graphs get a fixed 0–100 scale; auto-scaling them makes an
+    // idle 4% CPU render as a full-height wall. Byte graphs auto-scale.
     spark(
         f,
         chunks[2],
         "CPU %",
         &app.cpu_history,
         Color::Cyan,
+        Some(100),
         |last| format!("({last}%)"),
     );
     spark(
@@ -151,6 +167,7 @@ fn draw_performance(f: &mut Frame<'_>, area: Rect, app: &App) {
         "Memory %",
         &app.mem_history,
         Color::Magenta,
+        Some(100),
         |last| format!("({last}%)"),
     );
     spark(
@@ -159,6 +176,7 @@ fn draw_performance(f: &mut Frame<'_>, area: Rect, app: &App) {
         "Disk B/s (R+W)",
         &app.disk_history,
         Color::Yellow,
+        None,
         |last| format!("({}/s)", human_bytes(last)),
     );
     spark(
@@ -167,23 +185,28 @@ fn draw_performance(f: &mut Frame<'_>, area: Rect, app: &App) {
         "Net B/s (RX+TX)",
         &app.net_history,
         Color::Green,
+        None,
         |last| format!("({}/s)", human_bytes(last)),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spark<F>(
     f: &mut Frame<'_>,
     area: Rect,
     label: &str,
     data: &VecDeque<u64>,
     color: Color,
+    fixed_max: Option<u64>,
     format_last: F,
 ) where
     F: Fn(u64) -> String,
 {
     let last = data.back().copied().unwrap_or(0);
     let title = format!("{label}  {}", format_last(last));
-    let max = data.iter().copied().max().unwrap_or(1).max(1);
+    let max = fixed_max
+        .unwrap_or_else(|| data.iter().copied().max().unwrap_or(1))
+        .max(1);
     let slice: Vec<u64> = data.iter().copied().collect();
     let s = Sparkline::default()
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -193,9 +216,7 @@ fn spark<F>(
     f.render_widget(s, area);
 }
 
-fn draw_processes(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let rows_data = app.filtered_processes();
-
+fn draw_processes(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let arrow = match app.sort.order {
         SortOrder::Ascending => "↑",
         SortOrder::Descending => "↓",
@@ -215,8 +236,8 @@ fn draw_processes(f: &mut Frame<'_>, area: Rect, app: &App) {
         Cell::from("ST"),
         Cell::from(label(SortColumn::Cpu, "CPU%")),
         Cell::from(label(SortColumn::Memory, "MEM")),
-        Cell::from(label(SortColumn::NetRx, "RX/s")),
-        Cell::from(label(SortColumn::NetTx, "TX/s")),
+        Cell::from(label(SortColumn::DiskRead, "DiskR/s")),
+        Cell::from(label(SortColumn::DiskWrite, "DiskW/s")),
     ])
     .style(
         Style::default()
@@ -225,21 +246,27 @@ fn draw_processes(f: &mut Frame<'_>, area: Rect, app: &App) {
             .bg(Color::DarkGray),
     );
 
-    let rows: Vec<Row<'_>> = rows_data
-        .iter()
-        .map(|r| {
-            Row::new(vec![
-                Cell::from(r.pid.to_string()),
-                Cell::from(truncate(&r.user, 10)),
-                Cell::from(truncate(&r.name, 30)),
-                Cell::from(r.status.short()),
-                Cell::from(format!("{:>5.1}", r.cpu_percent)),
-                Cell::from(human_bytes(r.memory_bytes)),
-                Cell::from(opt_bytes(r.net_rx_per_sec)),
-                Cell::from(opt_bytes(r.net_tx_per_sec)),
-            ])
-        })
-        .collect();
+    // Cells own their strings, so the snapshot borrow ends with this block
+    // and the persistent table state below can be borrowed mutably.
+    let (rows, row_count) = {
+        let rows_data = app.filtered_processes();
+        let rows: Vec<Row<'_>> = rows_data
+            .iter()
+            .map(|r| {
+                Row::new(vec![
+                    Cell::from(r.pid.to_string()),
+                    Cell::from(truncate(&r.user, 10)),
+                    Cell::from(truncate(&r.name, 30)),
+                    Cell::from(r.status.short()),
+                    Cell::from(format!("{:>5.1}", r.cpu_percent)),
+                    Cell::from(human_bytes(r.memory_bytes)),
+                    Cell::from(rate_str(r.disk_read_per_sec)),
+                    Cell::from(rate_str(r.disk_write_per_sec)),
+                ])
+            })
+            .collect();
+        (rows, rows_data.len())
+    };
 
     let widths = [
         Constraint::Length(7),
@@ -252,18 +279,18 @@ fn draw_processes(f: &mut Frame<'_>, area: Rect, app: &App) {
         Constraint::Length(10),
     ];
 
-    let title = format!("Processes ({})", rows_data.len());
+    let title = format!("Processes ({row_count})");
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
         .highlight_symbol("▶ ");
 
-    let mut state = clamped_state(app.proc_selected, rows_data.len());
-    f.render_stateful_widget(table, area, &mut state);
+    select_row(&mut app.proc_table, app.proc_selected, row_count);
+    f.render_stateful_widget(table, area, &mut app.proc_table);
 }
 
-fn draw_startup(f: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_startup(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let header = Row::new(vec!["ON", "NAME", "SCOPE", "EXEC"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
@@ -299,11 +326,15 @@ fn draw_startup(f: &mut Frame<'_>, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
         .highlight_symbol("▶ ");
-    let mut state = clamped_state(app.startup_selected, app.autostart.len());
-    f.render_stateful_widget(table, area, &mut state);
+    select_row(
+        &mut app.startup_table,
+        app.startup_selected,
+        app.autostart.len(),
+    );
+    f.render_stateful_widget(table, area, &mut app.startup_table);
 }
 
-fn draw_services(f: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_services(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let header = Row::new(vec!["NAME", "ACTIVE", "SUB", "DESCRIPTION"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
@@ -347,14 +378,27 @@ fn draw_services(f: &mut Frame<'_>, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
         .highlight_symbol("▶ ");
-    let mut state = clamped_state(app.services_selected, app.services.len());
-    f.render_stateful_widget(table, area, &mut state);
+    select_row(
+        &mut app.services_table,
+        app.services_selected,
+        app.services.len(),
+    );
+    f.render_stateful_widget(table, area, &mut app.services_table);
 }
 
-fn clamped_state(selected: usize, len: usize) -> TableState {
-    let mut state = TableState::default();
-    if len > 0 {
-        state.select(Some(selected.min(len - 1)));
-    }
-    state
+/// Per-process disk rate cell. A true 0 B/s and a permission-denied
+/// `/proc/<pid>/io` read are indistinguishable, so render both as "—"
+/// rather than a wall of zeros.
+fn rate_str(v: u64) -> String {
+    opt_bytes((v > 0).then_some(v))
+}
+
+/// Update a persistent table state's selection, clamped to the row count.
+/// The state itself lives in `App` so the scroll offset survives redraws.
+fn select_row(state: &mut TableState, selected: usize, len: usize) {
+    state.select(if len == 0 {
+        None
+    } else {
+        Some(selected.min(len - 1))
+    });
 }

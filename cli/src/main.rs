@@ -87,6 +87,8 @@ fn handle_filter_key(app: &mut App, code: KeyCode) {
         KeyCode::Char(c) => app.filter.push(c),
         _ => {}
     }
+    // The visible list just changed shape — keep the highlight on its PID.
+    app.resync_proc_selection();
 }
 
 /// Returns `true` if the app should exit.

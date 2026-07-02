@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons"
 
 echo "==> Building release binaries..."
 cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
-mkdir -p "$BIN_DIR" "$APPS_DIR"
+mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
 
 echo "==> Installing CLI..."
 cp "$SCRIPT_DIR/target/release/taskmgr-cli" "$BIN_DIR/taskmgr-cli"
@@ -18,6 +19,9 @@ echo "==> Installing GUI..."
 cp "$SCRIPT_DIR/target/release/taskmgr-gui" "$BIN_DIR/taskmgr-gui"
 chmod +x "$BIN_DIR/taskmgr-gui"
 
+echo "==> Installing icon..."
+cp "$SCRIPT_DIR/assets/icon.png" "$ICON_DIR/taskmgr.png"
+
 echo "==> Creating desktop entry..."
 cat > "$APPS_DIR/taskmgr.desktop" << DESKTOP
 [Desktop Entry]
@@ -25,6 +29,7 @@ Type=Application
 Name=Task Manager
 Comment=System monitor — processes, performance, startup, and services
 Exec=$BIN_DIR/taskmgr-gui
+Icon=$ICON_DIR/taskmgr.png
 Terminal=false
 Categories=System;Monitor;
 DESKTOP
@@ -34,6 +39,7 @@ echo "Done."
 echo "  CLI : $BIN_DIR/taskmgr-cli"
 echo "  GUI : $BIN_DIR/taskmgr-gui"
 echo "  App : $APPS_DIR/taskmgr.desktop"
+echo "  Icon: $ICON_DIR/taskmgr.png"
 echo ""
 
 # Warn if ~/.local/bin is not in PATH
